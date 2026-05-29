@@ -102,28 +102,41 @@ async def send_voice_response(message: Message, text: str, slow: bool = False):
 
 
 def clean_for_tts(text: str) -> str:
-    """Убрать markdown символы и оставить только English для TTS."""
+    """
+    Для TTS берём только English часть — до блока с русской оценкой.
+    Русская оценка идёт после разделителя ---.
+    """
     import re
-    # Убираем markdown
-    text = re.sub(r'\*+', '', text)
-    text = re.sub(r'_+', '', text)
-    text = re.sub(r'`+', '', text)
-    text = re.sub(r'#+\s*', '', text)
-    # Убираем эмодзи-линии и разделители
-    text = re.sub(r'[-─═]{3,}', '', text)
-    # Убираем строки с оценкой (📈 Score: 8/10)
-    text = re.sub(r'📈.*?\n', '', text)
-    # Убираем строки начинающиеся с эмодзи оценки
-    text = re.sub(r'[✅🔧💡]\s*.*?\n', '\n', text)
-    text = text.strip()
-    # Ограничиваем длину (TTS лимит)
-    return text[:2000]
+
+    # Если есть блок оценки (---) — берём только часть ДО него
+    if "---" in text:
+        english_part = text.split("---")[0]
+    else:
+        english_part = text
+
+    # Убираем markdown символы
+    english_part = re.sub(r"\*+", "", english_part)
+    english_part = re.sub(r"_+", "", english_part)
+    english_part = re.sub(r"`+", "", english_part)
+    english_part = re.sub(r"#+\s*", "", english_part)
+    english_part = re.sub(r"[-─═]{3,}", "", english_part)
+
+    # Убираем строки полностью на русском (кириллица)
+    lines = english_part.split("\n")
+    english_lines = []
+    for line in lines:
+        # Если строка содержит кириллицу — пропускаем
+        if re.search(r"[а-яёА-ЯЁ]", line):
+            continue
+        english_lines.append(line)
+
+    result = "\n".join(english_lines).strip()
+    return result[:2000] if result else ""
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="🗣️ Разговорная практика", callback_data="speak"))
-    builder.add(InlineKeyboardButton(text="👂 Тренировка слуха", callback_data="listen"))
+    builder.add(InlineKeyboardButton(text="🎯 Практика (говорение + слух)", callback_data="speak"))
     builder.add(InlineKeyboardButton(text="📚 Учить слова", callback_data="words"))
     builder.add(InlineKeyboardButton(text="📊 Мой прогресс", callback_data="progress"))
     builder.adjust(1)
@@ -133,12 +146,12 @@ def main_keyboard() -> InlineKeyboardMarkup:
 def topic_keyboard() -> InlineKeyboardMarkup:
     topics = [
         ("✈️ Путешествия", "travel"),
-        ("💼 Работа", "work"),
+        ("💼 Работа и карьера", "work"),
         ("🍕 Еда и рестораны", "food"),
         ("🎬 Фильмы и сериалы", "movies"),
-        ("🌍 Культура", "culture"),
+        ("🌍 Культура и традиции", "culture"),
         ("🤖 Технологии", "tech"),
-        ("💪 Здоровье", "health"),
+        ("💪 Здоровье и спорт", "health"),
         ("🎲 Свободная тема", "free"),
     ]
     builder = InlineKeyboardBuilder()
@@ -306,17 +319,8 @@ async def cmd_speak(message: Message, state: FSMContext):
 
 @dp.message(Command("listen"))
 async def cmd_listen(message: Message, state: FSMContext):
-    await state.clear()
-    await db.ensure_user(message.from_user.id)
-    await state.set_state(SessionState.listening)
-
-    name, level = await get_user_context(message.from_user.id)
-    prompt = (
-        f"Start a listening exercise for a {level} student named {name}. "
-        "Read a short interesting passage (3-4 sentences) and then ask 2 comprehension questions. "
-        "Tell them to answer by voice or text."
-    )
-    await agent_reply(message, prompt, speak=True, slow=(level in ["A1", "A2"]))
+    """Слух и говорение теперь объединены — редиректим в /speak."""
+    await cmd_speak(message, state)
 
 
 @dp.message(Command("help"))
@@ -352,21 +356,12 @@ async def cb_speak(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "listen")
 async def cb_listen(callback: CallbackQuery, state: FSMContext):
+    """Объединено с speaking — редиректим."""
     await callback.answer()
-    await state.set_state(SessionState.listening)
-    name, level = await get_user_context(callback.from_user.id)
-
-    class FakeMessage:
-        chat = callback.message.chat
-        from_user = callback.from_user
-        async def answer(self, text, **kwargs):
-            await callback.message.answer(text, **kwargs)
-
-    prompt = (
-        f"Start a listening exercise for a {level} student. "
-        "Read a short interesting passage and ask comprehension questions."
+    await callback.message.answer(
+        "🎯 Выбери тему для практики:",
+        reply_markup=topic_keyboard(),
     )
-    await agent_reply(FakeMessage(), prompt, speak=True, slow=(level in ["A1", "A2"]))
 
 
 @dp.callback_query(F.data == "words")
@@ -410,10 +405,18 @@ async def cb_topic(callback: CallbackQuery, state: FSMContext):
         async def answer(self, text, **kwargs):
             await callback.message.answer(text, **kwargs)
 
+    topic_names = {
+        "travel": "путешествия", "work": "работа", "food": "еда",
+        "movies": "кино", "culture": "культура", "tech": "технологии",
+        "health": "здоровье", "free": "свободная тема"
+    }
+    topic_ru = topic_names.get(topic, topic)
     prompt = (
-        f"Start a speaking conversation about '{topic}' with {name} (level: {level}). "
-        "Ask one engaging opening question. Keep it natural and friendly. "
-        "Remind them they can answer by voice or text."
+        f"Start a combined speaking+listening practice session about '{topic}' with {name} (level: {level}). "
+        "Begin with a short interesting statement or mini-story (2-3 sentences) in English about this topic — "
+        "this is the listening part. Then ask ONE question. "
+        "Tell them in Russian: отвечай голосом или текстом на английском. "
+        "Keep your English clear and natural."
     )
     await agent_reply(FakeMessage(), prompt, speak=True)
 
