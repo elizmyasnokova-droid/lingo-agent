@@ -53,48 +53,59 @@ async def get_user_context(user_id: int) -> tuple[str, str]:
 
 async def agent_reply(message: Message, text: str, speak: bool = True, slow: bool = False):
     """Ответить текстом + голосом."""
-    await bot.send_chat_action(message.chat.id, "typing")
-    user = await db.get_user(message.from_user.id)
-    name, level = user.get("first_name", "Student"), user.get("level", "unknown")
-
-    history = await db.get_chat_history(message.from_user.id)
-    response = await chat(
+    await do_agent_reply(
+        chat_id=message.chat.id,
         user_id=message.from_user.id,
+        text=text,
+        speak=speak,
+        slow=slow,
+        reply_func=message.answer,
+    )
+
+
+async def do_agent_reply(chat_id: int, user_id: int, text: str,
+                          speak: bool, slow: bool, reply_func):
+    """Основная логика — принимает chat_id и user_id напрямую."""
+    await bot.send_chat_action(chat_id, "typing")
+    user = await db.get_user(user_id)
+    name = (user or {}).get("first_name") or "Student"
+    level = (user or {}).get("level") or "unknown"
+
+    history = await db.get_chat_history(user_id)
+    response = await chat(
+        user_id=user_id,
         message=text,
         history=history,
         user_name=name,
         user_level=level,
     )
 
-    await db.save_message(message.from_user.id, "user", text)
-    await db.save_message(message.from_user.id, "assistant", response)
+    await db.save_message(user_id, "user", text)
+    await db.save_message(user_id, "assistant", response)
 
-    # Отправляем текст
-    await message.answer(response)
+    await reply_func(response)
 
-    # Отправляем голос если нужно
     if speak:
-        await send_voice_response(message, response, slow=slow)
+        await send_voice_to_chat(chat_id, response, slow=slow)
 
     return response
 
 
 async def send_voice_response(message: Message, text: str, slow: bool = False):
-    """Конвертировать текст в голос и отправить."""
+    """Обёртка для совместимости."""
+    await send_voice_to_chat(message.chat.id, text, slow=slow)
+
+
+async def send_voice_to_chat(chat_id: int, text: str, slow: bool = False):
+    """Конвертировать текст в голос и отправить в чат."""
     try:
-        await bot.send_chat_action(message.chat.id, "upload_voice")
-        # Отправляем только английские части (убираем markdown и русский текст для TTS)
+        await bot.send_chat_action(chat_id, "upload_voice")
         clean_text = clean_for_tts(text)
         if not clean_text.strip():
             return
-
-        if slow:
-            audio = await text_to_speech_slow(clean_text)
-        else:
-            audio = await text_to_speech(clean_text)
-
+        audio = await text_to_speech_slow(clean_text) if slow else await text_to_speech(clean_text)
         await bot.send_voice(
-            message.chat.id,
+            chat_id,
             voice=BufferedInputFile(audio, filename="response.mp3"),
         )
     except Exception as e:
@@ -431,38 +442,52 @@ async def cb_speak(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "listen")
 async def cb_listen(callback: CallbackQuery, state: FSMContext):
-    """Объединено с speaking — редиректим."""
     await callback.answer()
-    await callback.message.answer(
-        "🎯 Выбери тему для практики:",
-        reply_markup=topic_keyboard(),
-    )
+    await callback.message.answer("🎯 Выбери тему для практики:", reply_markup=topic_keyboard())
 
 
 @dp.callback_query(F.data == "words")
 async def cb_words(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-
-    class FakeMessage:
-        chat = callback.message.chat
-        from_user = callback.from_user
-        async def answer(self, text, **kwargs):
-            await callback.message.answer(text, **kwargs)
-
-    await cmd_words(FakeMessage(), state)
+    await state.clear()
+    user_id = callback.from_user.id
+    await db.ensure_user(user_id)
+    vocab_stats = await db.get_vocab_stats(user_id)
+    total = vocab_stats["total"]
+    due = vocab_stats["due_today"]
+    text = "📚 *Словарный запас*\n\n"
+    if total > 0:
+        text += f"📖 Всего слов: *{total}*\n"
+        text += f"🔔 Пора повторить: *{due}*\n\n"
+    text += "Выбери тему для изучения:"
+    await callback.message.answer(text, parse_mode="Markdown", reply_markup=themes_keyboard())
 
 
 @dp.callback_query(F.data == "progress")
 async def cb_progress(callback: CallbackQuery):
     await callback.answer()
-
-    class FakeMessage:
-        chat = callback.message.chat
-        from_user = callback.from_user
-        async def answer(self, text, **kwargs):
-            await callback.message.answer(text, **kwargs)
-
-    await cmd_progress(FakeMessage())
+    user_id = callback.from_user.id
+    await db.ensure_user(user_id)
+    user = await db.get_user(user_id)
+    vocab_stats = await db.get_vocab_stats(user_id)
+    session_stats = await db.get_session_stats(user_id)
+    level = user.get("level", "not assessed")
+    streak = user.get("streak_days", 0)
+    streak_icon = "🔥" if streak >= 7 else ("⭐" if streak >= 3 else "🌱")
+    await callback.message.answer(
+        f"📊 *Your Progress*\n\n"
+        f"🎓 Level: *{level}*\n"
+        f"{streak_icon} Streak: *{streak} days*\n\n"
+        f"📚 *Vocabulary:*\n"
+        f"• Total words: *{vocab_stats['total']}*\n"
+        f"• Learned: *{vocab_stats['learned']}*\n"
+        f"• Due today: *{vocab_stats['due_today']}*\n\n"
+        f"🗣️ *Practice sessions:*\n"
+        f"• Total: *{session_stats['total_sessions']}*\n"
+        f"• Avg score: *{session_stats['avg_score']}/100*\n"
+        f"• Today: *{session_stats['sessions_today']}*",
+        parse_mode="Markdown",
+    )
 
 
 @dp.callback_query(F.data.startswith("topic_"))
@@ -472,13 +497,11 @@ async def cb_topic(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SessionState.speaking)
     await state.update_data(topic=topic, exchanges=0)
 
-    name, level = await get_user_context(callback.from_user.id)
-
-    class FakeMessage:
-        chat = callback.message.chat
-        from_user = callback.from_user
-        async def answer(self, text, **kwargs):
-            await callback.message.answer(text, **kwargs)
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    user = await db.get_user(user_id)
+    name = (user or {}).get("first_name") or "Student"
+    level = (user or {}).get("level") or "unknown"
 
     topic_names = {
         "travel": "путешествия", "work": "работа", "food": "еда",
@@ -486,14 +509,26 @@ async def cb_topic(callback: CallbackQuery, state: FSMContext):
         "health": "здоровье", "free": "свободная тема"
     }
     topic_ru = topic_names.get(topic, topic)
-    prompt = (
-        f"Start a combined speaking+listening practice session about '{topic}' with {name} (level: {level}). "
-        "Begin with a short interesting statement or mini-story (2-3 sentences) in English about this topic — "
-        "this is the listening part. Then ask ONE question. "
-        "Tell them in Russian: отвечай голосом или текстом на английском. "
-        "Keep your English clear and natural."
+
+    await callback.message.answer(
+        f"🎯 Тема: *{topic_ru}*\n\nНачинаем! Отвечай голосом или текстом на английском 🎙️",
+        parse_mode="Markdown"
     )
-    await agent_reply(FakeMessage(), prompt, speak=True)
+
+    prompt = (
+        f"Start a combined speaking+listening practice about '{topic}' with {name} (level: {level}). "
+        "Say 2-3 interesting sentences about this topic in English (listening practice), "
+        "then ask ONE clear question to start the conversation."
+    )
+
+    await do_agent_reply(
+        chat_id=chat_id,
+        user_id=user_id,
+        text=prompt,
+        speak=True,
+        slow=(level in ["A1", "A2"]),
+        reply_func=callback.message.answer,
+    )
 
 
 @dp.callback_query(F.data.startswith("word_correct_"))
