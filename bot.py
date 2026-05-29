@@ -249,34 +249,109 @@ async def cmd_progress(message: Message):
     )
 
 
+def themes_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора темы для слов."""
+    from vocabulary_data import VOCABULARY_THEMES
+    builder = InlineKeyboardBuilder()
+    for key, theme in VOCABULARY_THEMES.items():
+        builder.add(InlineKeyboardButton(
+            text=theme["name"],
+            callback_data=f"theme_{key}"
+        ))
+    builder.add(InlineKeyboardButton(text="🔄 Все темы (смешанные)", callback_data="theme_all"))
+    builder.add(InlineKeyboardButton(text="📖 Мои сохранённые слова", callback_data="theme_saved"))
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 @dp.message(Command("words"))
 async def cmd_words(message: Message, state: FSMContext):
     await state.clear()
     await db.ensure_user(message.from_user.id)
-    words = await db.get_words_for_review(message.from_user.id)
 
-    if not words:
-        all_words = await db.get_all_words(message.from_user.id)
-        if not all_words:
-            await message.answer(
-                "📚 *Your vocabulary is empty!*\n\n"
-                "Start a speaking session and I'll automatically save new words as we chat.",
-                parse_mode="Markdown",
+    vocab_stats = await db.get_vocab_stats(message.from_user.id)
+    total = vocab_stats["total"]
+    due = vocab_stats["due_today"]
+
+    text = "📚 *Словарный запас*\n\n"
+    if total > 0:
+        text += f"📖 Всего слов: *{total}*\n"
+        text += f"🔔 Пора повторить: *{due}*\n\n"
+    text += "Выбери тему для изучения:"
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=themes_keyboard())
+
+
+@dp.callback_query(F.data.startswith("theme_"))
+async def cb_theme_select(callback: CallbackQuery, state: FSMContext):
+    theme_key = callback.data.replace("theme_", "")
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    if theme_key == "all":
+        # Смешанные — все слова на повторение
+        words = await db.get_words_for_review(user_id, limit=20)
+        if not words:
+            await callback.message.answer(
+                "✅ Отлично! Нет слов для повторения.\n\n"
+                "Выбери тему чтобы загрузить новые слова!"
             )
-        else:
-            await message.answer(
-                f"✅ *All caught up!*\n\n"
-                f"You have {len(all_words)} words in your dictionary.\n"
-                f"No words due for review right now — check back later!",
-                parse_mode="Markdown",
+            return
+        theme_name = "Смешанные темы"
+
+    elif theme_key == "saved":
+        # Только сохранённые агентом слова (без category)
+        all_words = await db.get_all_words(user_id)
+        words = [w for w in all_words if not w.get("category") or
+                 w["category"] not in ["travel","food","work","daily","emotions",
+                                        "health","technology","shopping","people","nature"]]
+        if not words:
+            await callback.message.answer(
+                "📖 Сохранённых слов пока нет.\n\n"
+                "Они появятся автоматически во время разговорной практики!"
             )
-        return
+            return
+        words = [w for w in words if w.get("next_review", "") <= __import__("datetime").datetime.now().isoformat()][:20]
+        theme_name = "Мои сохранённые слова"
+
+    else:
+        from vocabulary_data import VOCABULARY_THEMES
+        theme = VOCABULARY_THEMES.get(theme_key)
+        if not theme:
+            return
+        theme_name = theme["name"]
+
+        # Загружаем тему если ещё не загружена
+        added = await db.seed_theme_vocabulary(user_id, theme_key)
+        if added > 0:
+            await callback.message.answer(
+                f"✨ Загружено *{added} новых слов* по теме {theme_name}!",
+                parse_mode="Markdown"
+            )
+
+        words = await db.get_words_by_theme(user_id, theme_key, limit=20)
+        if not words:
+            await callback.message.answer(
+                f"✅ По теме {theme_name} всё повторено!\n"
+                "Слова появятся снова через несколько дней."
+            )
+            return
 
     await state.set_state(SessionState.vocabulary)
-    await state.update_data(words=words, current_index=0, correct=0, incorrect=0)
-
-    word = words[0]
-    await show_word_card(message, word, 1, len(words))
+    await state.update_data(
+        words=words,
+        current_index=0,
+        correct=0,
+        incorrect=0,
+        theme_name=theme_name
+    )
+    await callback.message.answer(
+        f"📚 Тема: *{theme_name}*\n"
+        f"Слов для изучения: *{len(words)}*\n\n"
+        "Слушай произношение и проверяй знание! 🎯",
+        parse_mode="Markdown"
+    )
+    await show_word_card(callback.message, words[0], 1, len(words))
 
 
 async def show_word_card(message: Message, word: dict, current: int, total: int):
