@@ -286,6 +286,47 @@ async def clear_session_history(user_id: int):
         await db.commit()
 
 
+async def seed_theme_vocabulary(user_id: int, theme_key: str) -> int:
+    """Загрузить готовую лексику по теме для пользователя. Возвращает кол-во добавленных слов."""
+    from vocabulary_data import VOCABULARY_THEMES
+    theme = VOCABULARY_THEMES.get(theme_key)
+    if not theme:
+        return 0
+
+    added = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for word, translation, example in theme["words"]:
+            # Не добавляем дубликаты
+            async with db.execute(
+                "SELECT id FROM vocabulary WHERE user_id=? AND word=?",
+                (user_id, word)
+            ) as c:
+                existing = await c.fetchone()
+            if not existing:
+                await db.execute(
+                    """INSERT INTO vocabulary (user_id, word, translation, example, category)
+                       VALUES (?,?,?,?,?)""",
+                    (user_id, word, translation, example, theme_key)
+                )
+                added += 1
+        await db.commit()
+    return added
+
+
+async def get_words_by_theme(user_id: int, theme_key: str, limit: int = 10) -> list[dict]:
+    """Слова по конкретной теме для повторения."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM vocabulary WHERE user_id=? AND category=?
+               AND next_review <= datetime('now')
+               ORDER BY next_review ASC LIMIT ?""",
+            (user_id, theme_key, limit)
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
 async def get_all_users() -> list[int]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users") as c:
