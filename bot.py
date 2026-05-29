@@ -99,17 +99,37 @@ async def send_voice_response(message: Message, text: str, slow: bool = False):
 async def send_voice_to_chat(chat_id: int, text: str, slow: bool = False):
     """Конвертировать текст в голос и отправить в чат."""
     try:
-        await bot.send_chat_action(chat_id, "upload_voice")
         clean_text = clean_for_tts(text)
         if not clean_text.strip():
+            logger.warning("TTS: clean_for_tts returned empty string")
             return
+
+        logger.info(f"TTS: sending voice, text length={len(clean_text)}")
+        await bot.send_chat_action(chat_id, "upload_voice")
+
         audio = await text_to_speech_slow(clean_text) if slow else await text_to_speech(clean_text)
-        await bot.send_voice(
-            chat_id,
-            voice=BufferedInputFile(audio, filename="response.mp3"),
-        )
+
+        if not audio:
+            logger.warning("TTS: got empty audio bytes")
+            return
+
+        # Пробуем send_voice (OGG OPUS)
+        try:
+            await bot.send_voice(
+                chat_id,
+                voice=BufferedInputFile(audio, filename="voice.ogg"),
+            )
+            logger.info("TTS: voice sent successfully")
+        except Exception as voice_err:
+            logger.warning(f"send_voice failed: {voice_err} — trying send_audio")
+            # Fallback: send_audio принимает MP3
+            await bot.send_audio(
+                chat_id,
+                audio=BufferedInputFile(audio, filename="response.mp3"),
+            )
+
     except Exception as e:
-        logger.warning(f"Voice send failed: {e}")
+        logger.error(f"Voice send failed completely: {e}", exc_info=True)
 
 
 def clean_for_tts(text: str) -> str:
